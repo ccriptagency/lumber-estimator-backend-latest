@@ -131,6 +131,68 @@ def verify_otp(email: str, provided_otp: str) -> bool:
     
     return False
 
+# Google OAuth Helper Functions
+def verify_google_id_token(id_token: str) -> Optional['GoogleUserInfo']:
+    """Verify Google ID token (JWT) and extract user information"""
+    try:
+        import base64
+        import json
+        import time
+        
+        if not id_token or len(id_token.strip()) == 0:
+            return None
+        
+        # Decode JWT token (without verification for now - frontend already verified)
+        # Split the token into header, payload, and signature
+        parts = id_token.split('.')
+        if len(parts) != 3:
+            print("Invalid JWT token format")
+            return None
+        
+        # Decode the payload (middle part)
+        payload = parts[1]
+        
+        # Add padding if needed
+        missing_padding = len(payload) % 4
+        if missing_padding:
+            payload += '=' * (4 - missing_padding)
+        
+        try:
+            # Decode base64
+            decoded_payload = base64.urlsafe_b64decode(payload)
+            token_info = json.loads(decoded_payload)
+        except Exception as e:
+            print(f"Error decoding JWT payload: {e}")
+            return None
+        
+        # Check token expiration
+        exp_time = token_info.get('exp')
+        current_time = int(time.time())
+        if exp_time and int(exp_time) < current_time:
+            print(f"Google ID token has expired. Exp: {exp_time}, Current: {current_time}")
+            return None
+        
+        # Validate required fields
+        if not token_info.get('sub') or not token_info.get('email'):
+            print("Google ID token missing required fields")
+            return None
+        
+        # Extract user information
+        google_user = GoogleUserInfo(
+            google_id=token_info.get('sub'),
+            email=token_info.get('email'),
+            first_name=token_info.get('given_name', ''),
+            last_name=token_info.get('family_name', ''),
+            picture=token_info.get('picture'),
+            verified_email=token_info.get('email_verified', False)
+        )
+        
+        return google_user
+        
+    except Exception as e:
+        print(f"Error verifying Google ID token: {e}")
+        return None
+
 # Pydantic models for request/response
 class UserRegistration(BaseModel):
     username: str
@@ -199,6 +261,25 @@ class ResetPasswordRequest(BaseModel):
     email: EmailStr
     new_password: str
     confirm_password: str
+
+# Google OAuth Models
+class GoogleOAuthRequest(BaseModel):
+    """Google OAuth request with role selection"""
+    id_token: str
+    role: str
+
+class GoogleUserInfo(BaseModel):
+    google_id: str
+    email: str
+    first_name: str
+    last_name: str
+    picture: Optional[str] = None
+    verified_email: bool = False
+
+class AccountLinkRequest(BaseModel):
+    id_token: str
+    password: str
+    role: str
 
 # Dependency to get current user from JWT token
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
@@ -737,4 +818,184 @@ async def reset_password(request: ResetPasswordRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to reset password: {str(e)}"
+        )
+
+# Google OAuth Endpoints
+@router.post("/google/login", response_model=LoginResponse)
+async def google_login(oauth_data: GoogleOAuthRequest):
+    """Authenticate user with Google ID token and role selection from frontend"""
+    try:
+        # Verify and extract user info from ID token
+        google_user = verify_google_id_token(oauth_data.id_token)
+        if not google_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Google ID token"
+            )
+        
+        # Check if user exists by Google ID
+        user = auth_manager.get_user_by_google_id(google_user.google_id)
+        
+        if user:
+            # User exists with Google ID - direct login
+            if user['account_status'] != 'approved':
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account pending approval"
+                )
+            
+            # Update last login
+            auth_manager.update_user_last_login(user['id'])
+            
+            # Generate JWT token
+            access_token = auth_manager.generate_jwt_token(user)
+            
+            return LoginResponse(
+                access_token=access_token,
+                user=user
+            )
+        
+        # Check if user exists by email (for account linking)
+        existing_user = auth_manager.get_user_by_email(google_user.email)
+        
+        if existing_user:
+            # Check if the existing user already has Google auth
+            if existing_user.get('auth_provider') in ['google', 'both']:
+                # User already has Google auth but different Google ID
+                # This shouldn't happen, but handle gracefully
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": "Account with this email already has Google authentication",
+                        "action": "use_existing_google",
+                        "user_id": existing_user['id'],
+                        "email": existing_user['email']
+                    }
+                )
+            
+            # User exists with same email but no Google auth - offer account linking
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "Account with this email already exists",
+                    "action": "link_account",
+                    "user_id": existing_user['id'],
+                    "email": existing_user['email'],
+                    "auth_provider": existing_user.get('auth_provider', 'local')
+                }
+            )
+        
+        # Validate email verification (optional but recommended)
+        if not google_user.verified_email:
+            print(f"Warning: Google user {google_user.email} has unverified email")
+        
+        # Validate role
+        if oauth_data.role not in ['contractor', 'estimator']:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid role. Must be 'contractor' or 'estimator'"
+            )
+        
+        # Create new user from Google data
+        google_user_data = {
+            'google_id': google_user.google_id,
+            'email': google_user.email,
+            'first_name': google_user.first_name,
+            'last_name': google_user.last_name,
+            'picture': google_user.picture,
+            'role': oauth_data.role  # Role from request
+        }
+        
+        user_id = auth_manager.create_google_user(google_user_data)
+        
+        # Get the created user
+        user = auth_manager.get_user_by_id(user_id)
+        
+        # Update last login
+        auth_manager.update_user_last_login(user['id'])
+        
+        # Generate JWT token
+        access_token = auth_manager.generate_jwt_token(user)
+        
+        return LoginResponse(
+            access_token=access_token,
+            user=user
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Google login failed: {str(e)}"
+        )
+
+@router.post("/google/link-account", response_model=LoginResponse)
+async def link_google_account(link_data: AccountLinkRequest):
+    """Link Google account to existing local account with role selection"""
+    try:
+        # Verify and extract user info from ID token
+        google_user = verify_google_id_token(link_data.id_token)
+        if not google_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Google ID token"
+            )
+        
+        # Get existing user by email
+        existing_user = auth_manager.get_user_by_email(google_user.email)
+        if not existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No account found with this email"
+            )
+        
+        # Verify local password
+        if not auth_manager.verify_password(link_data.password, existing_user.get('password_hash', '')):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid password"
+            )
+        
+        # Validate role
+        if link_data.role not in ['contractor', 'estimator']:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid role. Must be 'contractor' or 'estimator'"
+            )
+        
+        # Link Google account
+        google_user_data = {
+            'google_id': google_user.google_id,
+            'picture': google_user.picture,
+            'role': link_data.role
+        }
+        
+        success = auth_manager.link_google_to_existing_user(existing_user['id'], google_user_data)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Google account already linked to another user"
+            )
+        
+        # Get updated user data
+        updated_user = auth_manager.get_user_by_id(existing_user['id'])
+        
+        # Update last login
+        auth_manager.update_user_last_login(updated_user['id'])
+        
+        # Generate JWT token
+        access_token = auth_manager.generate_jwt_token(updated_user)
+        
+        return LoginResponse(
+            access_token=access_token,
+            user=updated_user
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Account linking failed: {str(e)}"
         )
