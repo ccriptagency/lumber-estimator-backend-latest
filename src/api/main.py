@@ -1427,6 +1427,10 @@ async def get_projects(current_user: Dict[str, Any] = Depends(get_current_user))
                     "example": {
                         "project_id": 3,
                         "project_name": "LAMONS 3200LS BL ELEV",
+                        "user_name": "john_doe",
+                        "user_email": "john.doe@example.com",
+                        "first_name": "John",
+                        "last_name": "Doe",
                         "total_cost": 16423.45,
                         "total_items_count": 15,
                         "items_needing_quotation": 2,
@@ -1487,6 +1491,7 @@ async def get_project(project_id: int, current_user: Dict[str, Any] = Depends(ge
     
     **Response Includes:**
     - **Project Info**: Name, description, dates, status
+    - **User Information**: Username, email, first name, and last name of project owner
     - **Building Dimensions**: From PDF analysis
     - **All Items**: Combined list of PDF-detected and manual items
     - **Unified Totals**: Combined cost and item count
@@ -1582,6 +1587,12 @@ async def get_project(project_id: int, current_user: Dict[str, Any] = Depends(ge
             all_items.append(item_copy)
         
         # Structure the response with combined items
+        # Get user information for the project owner
+        from ..database.auth_models import AuthDatabaseManager, UserAuthManager
+        auth_db = AuthDatabaseManager()
+        auth_manager = UserAuthManager(auth_db)
+        project_owner = auth_manager.get_user_by_id(project['user_id'])
+        
         response = {
             "project_id": project['id'],
             "project_name": project['name'],
@@ -1591,6 +1602,12 @@ async def get_project(project_id: int, current_user: Dict[str, Any] = Depends(ge
             "status": project.get('status'),
             "created_at": project.get('created_at'),
             "updated_at": project.get('updated_at'),
+            
+            # User information
+            "user_name": project_owner.get('username') if project_owner else None,
+            "user_email": project_owner.get('email') if project_owner else None,
+            "first_name": project_owner.get('first_name') if project_owner else None,
+            "last_name": project_owner.get('last_name') if project_owner else None,
             
             # Combined totals (no separate PDF/manual costs)
             "total_cost": project.get('combined_total_cost', 0.0),

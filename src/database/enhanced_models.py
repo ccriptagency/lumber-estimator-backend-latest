@@ -1773,6 +1773,116 @@ class QuotationManager:
             
             conn.commit()
             return cursor.rowcount > 0
+    
+    def clone_quotation(self, source_quotation_id: int, user_id: int, new_quotation_data: Dict[str, Any] = None) -> int:
+        """Clone an existing quotation with all its items and optionally add new items"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get the source quotation
+            cursor.execute('''
+                SELECT * FROM quotations WHERE id = ?
+            ''', (source_quotation_id,))
+            
+            source_quotation = cursor.fetchone()
+            if not source_quotation:
+                raise ValueError("Source quotation not found")
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+            source_data = dict(zip(columns, source_quotation))
+            
+            # Create new quotation with copied data (just change the name to indicate it's a copy)
+            new_quotation_name = f"Copy of {source_data.get('quotation_name', 'Quotation')}"
+            
+            cursor.execute('''
+                INSERT INTO quotations (
+                    user_id, quotation_name, client_name, client_email, 
+                    client_phone, project_address, project_description, 
+                    notes, valid_until, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id,
+                new_quotation_name,
+                source_data.get('client_name'),
+                source_data.get('client_email'),
+                source_data.get('client_phone'),
+                source_data.get('project_address'),
+                source_data.get('project_description'),
+                source_data.get('notes'),
+                source_data.get('valid_until'),
+                'pending'  # New quotation starts as pending
+            ))
+            
+            new_quotation_id = cursor.lastrowid
+            
+            # Clone all items from source quotation
+            cursor.execute('''
+                SELECT * FROM quotation_items WHERE quotation_id = ?
+            ''', (source_quotation_id,))
+            
+            source_items = cursor.fetchall()
+            item_columns = [desc[0] for desc in cursor.description]
+            
+            for item_row in source_items:
+                item_data = dict(zip(item_columns, item_row))
+                
+                # Insert item into new quotation (excluding the original ID)
+                cursor.execute('''
+                    INSERT INTO quotation_items (
+                        quotation_id, item_name, sku, unit, unit_of_measure, 
+                        cost, quantity, total_cost, description, category
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    new_quotation_id,
+                    item_data['item_name'],
+                    item_data['sku'],
+                    item_data['unit'],
+                    item_data['unit_of_measure'],
+                    item_data['cost'],
+                    item_data['quantity'],
+                    item_data['total_cost'],
+                    item_data['description'],
+                    item_data['category']
+                ))
+            
+            # Add new item if provided
+            if new_quotation_data and new_quotation_data.get('item_name'):
+                quantity = 1  # Default quantity
+                cost = new_quotation_data.get('cost', 0)
+                total_cost = quantity * cost
+                
+                cursor.execute('''
+                    INSERT INTO quotation_items (
+                        quotation_id, item_name, sku, unit, unit_of_measure, 
+                        cost, quantity, total_cost, description, category
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    new_quotation_id,
+                    new_quotation_data['item_name'],
+                    new_quotation_data.get('sku'),
+                    new_quotation_data.get('unit_of_measure', 'each'),
+                    new_quotation_data.get('unit_of_measure', 'each'),
+                    cost,
+                    quantity,
+                    total_cost,
+                    None,  # Default description
+                    None   # Default category
+                ))
+            
+            # Update total cost for the new quotation
+            cursor.execute('''
+                UPDATE quotations 
+                SET total_cost = (
+                    SELECT COALESCE(SUM(total_cost), 0) 
+                    FROM quotation_items 
+                    WHERE quotation_id = ?
+                )
+                WHERE id = ?
+            ''', (new_quotation_id, new_quotation_id))
+            
+            conn.commit()
+            return new_quotation_id
 
 
 class QuotationItemManager:

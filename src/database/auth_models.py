@@ -266,8 +266,8 @@ class UserAuthManager:
     #             'company_name': company_name,
     #             'profile_completed': profile_completed
     #         }
-    def authenticate_user(self, username: str, password: str) -> Optional[Dict]:
-        """Authenticate user and return user data"""
+    def authenticate_user(self, username: str, password: str) -> Dict[str, Any]:
+        """Authenticate user and return user data with specific error information"""
         with self.auth_db.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -279,7 +279,7 @@ class UserAuthManager:
             
             row = cursor.fetchone()
             if not row:
-                return None # User does not exist
+                return {"error": "user_not_found", "message": "User does not exist"}
             
             # Unpack all data from the row
             columns = [desc[0] for desc in cursor.description]
@@ -287,7 +287,7 @@ class UserAuthManager:
             
             # Verify password first
             if not self.verify_password(password, user['password_hash']):
-                return None # Incorrect password
+                return {"error": "invalid_password", "message": "Invalid credentials"}
             
             # Password is correct, now update last login
             cursor.execute('''

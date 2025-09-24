@@ -369,29 +369,41 @@ async def register_user(user_data: UserRegistration):
 @router.post("/login", response_model=LoginResponse)
 async def login_user(login_data: UserLogin):
     """Authenticate user and return JWT token"""
-    # This function now correctly returns user data if the password is valid
-    user = auth_manager.authenticate_user(login_data.username, login_data.password)
+    # This function now returns user data or error information
+    auth_result = auth_manager.authenticate_user(login_data.username, login_data.password)
     
-    # Case 1: User is None (means username not found or password was wrong)
-    if not user:
+    # Case 1: User does not exist
+    if "error" in auth_result and auth_result["error"] == "user_not_found":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User does not exist"
+        )
+    
+    # Case 2: Wrong password
+    if "error" in auth_result and auth_result["error"] == "invalid_password":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username/email or password"
+            detail="Invalid credentials"
         )
     
-    # Case 2: User exists and password is correct, but account is not approved
-    if user['account_status'] != 'approved':
+    # Case 3: User exists and password is correct, but account is not approved
+    if auth_result['account_status'] == 'rejected':
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Pending Approval"
+            detail="Your account has been rejected. Please contact support for assistance."
+        )
+    elif auth_result['account_status'] != 'approved':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is pending admin approval. Please wait until it is approved."
         )
     
-    # Case 3: Success! User exists, password is correct, and account is approved
-    access_token = auth_manager.generate_jwt_token(user)
+    # Case 4: Success! User exists, password is correct, and account is approved
+    access_token = auth_manager.generate_jwt_token(auth_result)
     
     return LoginResponse(
         access_token=access_token,
-        user=user
+        user=auth_result
     )
 
 @router.get("/profile", response_model=Dict[str, Any])
