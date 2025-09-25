@@ -99,6 +99,36 @@ class AuthDatabaseManager:
             self._create_default_admin(cursor)
             
             conn.commit()
+            
+            # Run migrations for existing databases
+            self._migrate_google_auth_support()
+    
+    def _migrate_google_auth_support(self):
+        """Add Google auth columns to existing users table"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if google_id column exists
+            cursor.execute("PRAGMA table_info(users)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            # Add google_id column if it doesn't exist
+            if 'google_id' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN google_id TEXT')
+                print("Added google_id column to users table")
+            
+            # Add auth_provider column if it doesn't exist
+            if 'auth_provider' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN auth_provider TEXT DEFAULT "local"')
+                print("Added auth_provider column to users table")
+            
+            # Add google_picture_url column if it doesn't exist
+            if 'google_picture_url' not in columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN google_picture_url TEXT')
+                print("Added google_picture_url column to users table")
+            
+            conn.commit()
+            print("Google auth migration completed successfully")
     
     def _create_default_admin(self, cursor):
         """Create default admin user"""
@@ -236,8 +266,8 @@ class UserAuthManager:
     #             'company_name': company_name,
     #             'profile_completed': profile_completed
     #         }
-    def authenticate_user(self, username: str, password: str) -> Optional[Dict]:
-        """Authenticate user and return user data"""
+    def authenticate_user(self, username: str, password: str) -> Dict[str, Any]:
+        """Authenticate user and return user data with specific error information"""
         with self.auth_db.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -249,7 +279,7 @@ class UserAuthManager:
             
             row = cursor.fetchone()
             if not row:
-                return None # User does not exist
+                return {"error": "user_not_found", "message": "User does not exist"}
             
             # Unpack all data from the row
             columns = [desc[0] for desc in cursor.description]
@@ -257,7 +287,7 @@ class UserAuthManager:
             
             # Verify password first
             if not self.verify_password(password, user['password_hash']):
-                return None # Incorrect password
+                return {"error": "invalid_password", "message": "Invalid credentials"}
             
             # Password is correct, now update last login
             cursor.execute('''
@@ -705,3 +735,151 @@ class UserAuthManager:
                 current_dt += timedelta(days=5)
             
             return periods
+    
+    def create_google_user(self, user_data: Dict[str, Any]) -> int:
+        """Create a new user from Google OAuth data"""
+        with self.auth_db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Generate username from email
+            email = user_data['email']
+            base_username = email.split('@')[0].replace('.', '_').replace('-', '_')
+            username = base_username
+            
+            # Ensure username is unique
+            counter = 1
+            while True:
+                cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
+                if not cursor.fetchone():
+                    break
+                username = f"{base_username}_{counter}"
+                counter += 1
+            
+            # Insert new user
+            cursor.execute('''
+                INSERT INTO users (
+                    username, email, password_hash, role, account_status,
+                    first_name, last_name, google_id, auth_provider, google_picture_url,
+                    created_at, last_login
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ''', (
+                username,
+                user_data['email'],
+                '',  # No password for Google users
+                user_data.get('role', 'contractor'),  # Role from request
+                'pending',  # Set to pending for admin approval
+                user_data.get('first_name', ''),
+                user_data.get('last_name', ''),
+                user_data.get('google_id', ''),
+                'google',
+                user_data.get('picture', '')
+            ))
+            
+            user_id = cursor.lastrowid
+            conn.commit()
+            return user_id
+    
+    def get_user_by_google_id(self, google_id: str) -> Optional[Dict[str, Any]]:
+        """Get user by Google ID"""
+        with self.auth_db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, username, email, password_hash, role, account_status,
+                       first_name, last_name, company_name, profile_completed,
+                       google_id, auth_provider, google_picture_url, created_at, last_login
+                FROM users WHERE google_id = ?
+            ''', (google_id,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            return {
+                'id': row[0],
+                'username': row[1],
+                'email': row[2],
+                'password_hash': row[3],
+                'role': row[4],
+                'account_status': row[5],
+                'first_name': row[6],
+                'last_name': row[7],
+                'company_name': row[8],
+                'profile_completed': row[9],
+                'google_id': row[10],
+                'auth_provider': row[11],
+                'google_picture_url': row[12],
+                'created_at': row[13],
+                'last_login': row[14]
+            }
+    
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Get user by email address"""
+        with self.auth_db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, username, email, password_hash, role, account_status,
+                       first_name, last_name, company_name, profile_completed,
+                       google_id, auth_provider, google_picture_url, created_at, last_login
+                FROM users WHERE email = ?
+            ''', (email,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            return {
+                'id': row[0],
+                'username': row[1],
+                'email': row[2],
+                'password_hash': row[3],
+                'role': row[4],
+                'account_status': row[5],
+                'first_name': row[6],
+                'last_name': row[7],
+                'company_name': row[8],
+                'profile_completed': row[9],
+                'google_id': row[10],
+                'auth_provider': row[11],
+                'google_picture_url': row[12],
+                'created_at': row[13],
+                'last_login': row[14]
+            }
+    
+    def link_google_to_existing_user(self, user_id: int, google_user_data: Dict[str, Any]) -> bool:
+        """Link Google account to existing user"""
+        with self.auth_db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if user exists
+            cursor.execute('SELECT id, auth_provider FROM users WHERE id = ?', (user_id,))
+            user = cursor.fetchone()
+            if not user:
+                return False
+            
+            current_auth_provider = user[1] or 'local'
+            
+            # Update auth provider and Google info
+            if current_auth_provider == 'local':
+                new_auth_provider = 'both'
+            else:
+                new_auth_provider = current_auth_provider
+            
+            cursor.execute('''
+                UPDATE users 
+                SET google_id = ?, auth_provider = ?, google_picture_url = ?, role = ?
+                WHERE id = ?
+            ''', (google_user_data['google_id'], new_auth_provider, google_user_data.get('picture', ''), google_user_data.get('role', 'contractor'), user_id))
+            
+            conn.commit()
+            return True
+    
+    def update_user_last_login(self, user_id: int) -> bool:
+        """Update user's last login timestamp"""
+        with self.auth_db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?
+            ''', (user_id,))
+            conn.commit()
+            return True
+    

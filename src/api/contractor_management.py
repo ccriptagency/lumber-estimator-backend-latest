@@ -309,6 +309,24 @@ class QuotationResponse(BaseModel):
     created_at: str
     updated_at: str
 
+class CloneQuotationItem(BaseModel):
+    """Model for new items to add when cloning a quotation"""
+    item_name: str = Field(..., description="Name of the item")
+    sku: Optional[str] = Field(None, description="SKU/Product Code")
+    unit: str = Field(..., description="Unit of measure")
+    unit_of_measure: str = Field(..., description="Unit description")
+    cost: float = Field(..., description="Cost per unit")
+    quantity: float = Field(1, description="Quantity of the item")
+    description: Optional[str] = Field(None, description="Item description")
+    category: Optional[str] = Field(None, description="Item category")
+
+class CloneQuotationRequest(BaseModel):
+    """Request model for cloning a quotation - simplified to add a single new item"""
+    item_name: Optional[str] = Field(None, description="Name of the new item to add (optional)")
+    sku: Optional[str] = Field(None, description="SKU/Product Code of the new item (optional)")
+    unit_of_measure: Optional[str] = Field(None, description="Unit of measure for the new item (optional)")
+    cost: Optional[float] = Field(None, description="Cost per unit for the new item (optional)")
+
 # Enhanced Contractor Profile Endpoints
 @router.post(
     "/profiles/",
@@ -1718,5 +1736,144 @@ async def get_user_quotations(
         }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post(
+    "/quotations/{source_quotation_id}/clone",
+    response_model=dict,
+    summary="📋 Clone Quotation",
+    description="Clone an existing quotation with all its items and optionally add new items",
+    response_description="Quotation cloned successfully",
+    responses={
+        200: {
+            "description": "Quotation cloned successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "message": "Quotation cloned successfully",
+                        "data": {
+                            "new_quotation_id": 124,
+                            "source_quotation_id": 123,
+                            "quotation_name": "Copy of Office Renovation Project",
+                            "total_items": 3,
+                            "total_cost": 1500.00,
+                            "status": "pending",
+                            "cloned_items": 2,
+                            "new_items_added": 1,
+                            "client_name": "ABC Corporation",
+                            "client_email": "contact@abc-corp.com",
+                            "project_description": "Complete office renovation"
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "description": "Source quotation not found",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": False,
+                        "message": "Source quotation not found",
+                        "detail": "Source quotation not found"
+                    }
+                }
+            }
+        }
+    }
+)
+async def clone_quotation(
+    source_quotation_id: int,
+    user_id: int = Query(..., description="User ID who is creating the cloned quotation"),
+    clone_data: CloneQuotationRequest = None
+):
+    """
+    ## Clone Quotation 📋
+    
+    Clone an existing quotation with all its items and optionally add new items.
+    This creates a new quotation with a new ID while preserving all original data.
+    
+    **Features:**
+    - ✅ Copies ALL data from source quotation (client info, project details, etc.)
+    - ✅ Copies all items from source quotation
+    - ✅ Optionally adds new items if provided
+    - ✅ Generates new quotation ID automatically
+    - ✅ Sets status to 'pending' for new quotation
+    - ✅ Auto-generates name as "Copy of [original name]"
+    
+    **Required Fields:**
+    - `source_quotation_id`: ID of the quotation to clone
+    - `user_id`: User creating the cloned quotation
+    
+    **Optional Fields (for adding a new item):**
+    - `item_name`: Name of the new item to add ✅
+    - `sku`: SKU/Product Code ✅
+    - `unit_of_measure`: Unit of measure ✅
+    - `cost`: Cost per unit ✅
+    
+    **Response includes:**
+    - `new_quotation_id`: Auto-assigned ID for the cloned quotation
+    - `source_quotation_id`: ID of the original quotation
+    - `total_items`: Total number of items in the new quotation
+    - `total_cost`: Calculated total cost
+    - `cloned_items`: Number of items copied from source
+    - `new_items_added`: Number of new items added
+    
+    **Example Use Cases:**
+    - Creating variations of existing quotations
+    - Adding items to existing quotation templates
+    - Duplicating successful quotations for similar projects
+    - Creating quotation templates for future use
+    """
+    try:
+        # Verify source quotation exists
+        source_quotation = quotation_manager.get_quotation(source_quotation_id)
+        if not source_quotation:
+            raise HTTPException(status_code=404, detail="Source quotation not found")
+        
+        # Prepare clone data
+        clone_data_dict = clone_data.dict() if clone_data else {}
+        
+        # Clone the quotation
+        new_quotation_id = quotation_manager.clone_quotation(
+            source_quotation_id, 
+            user_id, 
+            clone_data_dict
+        )
+        
+        # Get the new quotation details
+        new_quotation = quotation_manager.get_quotation(new_quotation_id)
+        new_items = quotation_item_manager.get_items_by_quotation(new_quotation_id)
+        
+        # Count items
+        source_items = quotation_item_manager.get_items_by_quotation(source_quotation_id)
+        cloned_items_count = len(source_items)
+        new_items_count = 1 if clone_data_dict.get('item_name') else 0
+        total_items = len(new_items)
+        
+        return {
+            "success": True,
+            "message": "Quotation cloned successfully",
+            "data": {
+                "new_quotation_id": new_quotation_id,
+                "source_quotation_id": source_quotation_id,
+                "quotation_name": new_quotation.get('quotation_name'),
+                "total_items": total_items,
+                "total_cost": new_quotation.get('total_cost', 0),
+                "status": new_quotation.get('status', 'pending'),
+                "cloned_items": cloned_items_count,
+                "new_items_added": new_items_count,
+                "client_name": new_quotation.get('client_name'),
+                "client_email": new_quotation.get('client_email'),
+                "project_description": new_quotation.get('project_description'),
+                "created_at": new_quotation.get('created_at')
+            }
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
